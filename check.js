@@ -1,27 +1,55 @@
-/* Proxies frescos de paises objetivo que conectan a un TARGET https.
- * Standalone (solo stdlib node): descarga por pais (proxyscrape+geonode) + 10
- * listas bulk filtradas ANTES por rangos locales (ip-zones), pre-filtra TCP y
- * comprueba cada proxy con CONNECT + TLS + GET / al TARGET. Sin cuentas ni keys.
+/*
+ * Proxies frescos de paises objetivo que conectan a un TARGET https.
+ *
+ * Optimizado para grandes cantidades de proxies:
+ *   - Descargas por-pais concurrentes y con limite.
+ *   - Filtro bulk por IP antes de cualquier conexion.
+ *   - TCP y target-check con workers persistentes, sin bloques de 1000.
+ *   - Cola mediante indice (sin Array.shift()).
+ *   - Menos salida por consola.
+ *   - CONNECT + TLS + GET contra TARGET.
  *
  * Uso:
  *   node check.js
- *   node check.js --target www.google.com --jobs 60 --timeout 6000
- *   node check.js --no-bulk   (solo fuentes por-pais, mas rapido)
+ *   node check.js --target www.google.com --jobs 150 --tcp-jobs 300 --timeout 6000
+ *   node check.js --no-bulk
  *   node check.js --extra lista-propia.txt
+ *
+ * Opciones adicionales:
+ *   --jobs N          Concurrencia del check real (default 120)
+ *   --tcp-jobs N      Concurrencia TCP (default 300)
+ *   --tcp-timeout N   Timeout TCP en ms (default 1200)
+ *   --timeout N       Timeout total del check real en ms (default 6000)
+ *   --source-jobs N   Concurrencia de descargas por-pais (default 4)
+ *   --progress N      Mostrar progreso cada N checks (default 100)
  */
+
 const fs = require("fs");
 const net = require("net");
 const tls = require("tls");
 const path = require("path");
 
 const args = process.argv.slice(2);
-const opt = (n, d) => { const i = args.indexOf(n); return i >= 0 && args[i + 1] ? args[i + 1] : d; };
+const opt = (n, d) => {
+  const i = args.indexOf(n);
+  return i >= 0 && args[i + 1] ? args[i + 1] : d;
+};
 const has = (n) => args.includes(n);
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+const intOpt = (name, def, min, max) => {
+  const n = parseInt(opt(name, String(def)), 10);
+  if (!Number.isFinite(n)) return def;
+  return Math.max(min, Math.min(max, n));
+};
 
 const TARGET = opt("--target", "www.example.com");
-const PS = (cc) => `https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=10000&country=${cc}&ssl=all&anonymity=all`;
-const GEO = (cc, page = 1) => `https://proxylist.geonode.com/api/proxy-list?limit=200&page=${page}&sort_by=lastChecked&sort_type=desc&country=${cc}`;
+
+const PS = (cc) =>
+  `https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=10000&country=${cc}&ssl=all&anonymity=all`;
+
+const GEO = (cc, page = 1) =>
+  `https://proxylist.geonode.com/api/proxy-list?limit=200&page=${page}&sort_by=lastChecked&sort_type=desc&country=${cc}`;
+
 const BULKS = [
   "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
   "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
@@ -37,200 +65,729 @@ const BULKS = [
 
 async function fetchText(url, ms = 20000) {
   const ctl = new AbortController();
-  const t = setTimeout(() => ctl.abort(), ms);
-  try { return await (await fetch(url, { signal: ctl.signal })).text(); }
-  finally { clearTimeout(t); }
+  const timer = setTimeout(() => ctl.abort(), ms);
+
+  try {
+    const res = await fetch(url, {
+      signal: ctl.signal,
+      headers: {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "text/plain, application/json, */*",
+      },
+    });
+
+    if (!res.ok) {
+      throw new Error(`HTTP ${res.status}`);
+    }
+
+    return await res.text();
+  } finally {
+    clearTimeout(timer);
+  }
 }
+
+/*
+ * Devuelve proxies unicos.
+ * Se mantiene deliberadamente compatible con el formato original:
+ * IP:PORT, sin dominios, paths ni credenciales.
+ */
 function clean(lines) {
   const out = new Set();
+
   for (let s of lines) {
-    s = String(s || "").trim().replace(/^https?:\/\//i, "").split(/\s/)[0];
+    s = String(s || "").trim();
+
+    if (!s) continue;
+
+    // Elimina protocolo.
+    s = s.replace(/^https?:\/\//i, "");
+
+    // Solo la primera columna.
+    const sp = s.search(/\s/);
+    if (sp >= 0) s = s.slice(0, sp);
+
     if (!s || s.includes("@") || s.includes("/")) continue;
+
     const i = s.lastIndexOf(":");
     if (i < 0) continue;
-    const ip = s.slice(0, i), port = s.slice(i + 1);
-    if (!/^\d{1,5}$/.test(port) || +port < 1 || +port > 65535) continue;
-    if (!/^[\d.]+$/.test(ip) || ip.split(".").length !== 4) continue;
+
+    const ip = s.slice(0, i);
+    const port = s.slice(i + 1);
+
+    if (!/^\d{1,5}$/.test(port)) continue;
+
+    const pn = Number(port);
+    if (pn < 1 || pn > 65535) continue;
+
+    // Solo IPv4, igual que el programa original.
+    if (!/^\d{1,3}(?:\.\d{1,3}){3}$/.test(ip)) continue;
+
+    const oct = ip.split(".");
+    if (oct.some((x) => Number(x) > 255)) continue;
+
     out.add(`${ip}:${port}`);
   }
+
   return [...out];
 }
+
+/*
+ * TCP check.
+ * El socket se destruye inmediatamente al conectar:
+ * solo nos interesa saber si el endpoint acepta TCP.
+ */
 function tcpOpen(p, ms) {
   return new Promise((resolve) => {
     const i = p.lastIndexOf(":");
-    const s = net.connect(+p.slice(i + 1), p.slice(0, i));
-    const t = setTimeout(() => { try { s.destroy(); } catch (_) {} resolve(null); }, ms);
-    s.once("error", () => { clearTimeout(t); resolve(null); });
-    s.once("connect", () => { clearTimeout(t); try { s.destroy(); } catch (_) {} resolve(p); });
+    const host = p.slice(0, i);
+    const port = Number(p.slice(i + 1));
+
+    let finished = false;
+
+    const sock = net.connect({
+      host,
+      port,
+      timeout: ms,
+    });
+
+    const done = (value) => {
+      if (finished) return;
+      finished = true;
+
+      try {
+        sock.destroy();
+      } catch (_) {}
+
+      resolve(value);
+    };
+
+    sock.once("connect", () => done(p));
+    sock.once("timeout", () => done(null));
+    sock.once("error", () => done(null));
   });
 }
+
 function parseProxy(p) {
   let s = String(p || "").trim().replace(/^https?:\/\//i, "");
   let auth = null;
+
   const at = s.lastIndexOf("@");
-  if (at >= 0) { auth = s.slice(0, at); s = s.slice(at + 1); }
+
+  if (at >= 0) {
+    auth = s.slice(0, at);
+    s = s.slice(at + 1);
+  }
+
   const i = s.lastIndexOf(":");
-  if (i < 0) throw new Error("proxy sin puerto");
-  return { host: s.slice(0, i), port: parseInt(s.slice(i + 1), 10) || 8080, auth };
+
+  if (i < 0) {
+    throw new Error("proxy sin puerto");
+  }
+
+  const host = s.slice(0, i);
+  const port = parseInt(s.slice(i + 1), 10);
+
+  if (!host || !Number.isFinite(port) || port < 1 || port > 65535) {
+    throw new Error("proxy invalido");
+  }
+
+  return { host, port, auth };
 }
-// Check real: CONNECT al proxy + TLS + GET / al TARGET. true si hay respuesta HTTP.
+
+/*
+ * Check real:
+ *
+ *   TCP al proxy
+ *   CONNECT TARGET:443
+ *   TLS handshake
+ *   GET /
+ *
+ * Se considera valido cualquier HTTP 2xx-4xx recibido del TARGET.
+ */
 function targetCheck(p, timeoutMs) {
   return new Promise((resolve) => {
     let proxy;
-    try { proxy = parseProxy(p); } catch (_) { resolve(false); return; }
-    let done = false;
-    const ok = (v) => { if (!done) { done = true; clearTimeout(t); try { sock.destroy(); } catch (_) {} resolve(v); } };
-    const t = setTimeout(() => ok(false), timeoutMs);
-    const sock = net.connect(proxy.port, proxy.host);
-    let stage = "tunnel", buf = "";
-    sock.once("error", () => ok(false));
-    sock.once("connect", () => {
-      let req = `CONNECT ${TARGET}:443 HTTP/1.1\r\nHost: ${TARGET}:443\r\n`;
-      if (proxy.auth) req += `Proxy-Authorization: Basic ${Buffer.from(proxy.auth).toString("base64")}\r\n`;
-      sock.write(req + "\r\n");
-    });
-    sock.on("data", onData);
-    function onData(c) {
-      if (stage !== "tunnel") return;
-      buf += c.toString("latin1");
-      if (!buf.includes("\r\n\r\n")) return;
-      if (!/^HTTP\/1\.[01] 200/i.test(buf)) { ok(false); return; }
-      sock.off("data", onData); // sin esto el listener crudo le roba el handshake al TLS
-      stage = "tls";
-      const sec = tls.connect({ socket: sock, servername: TARGET }, () => {
-        sec.write(`GET / HTTP/1.1\r\nHost: ${TARGET}\r\nUser-Agent: Mozilla/5.0\r\nConnection: close\r\n\r\n`);
-      });
-      sec.once("error", () => ok(false));
-      let h = "";
-      sec.on("data", (d) => {
-        h += d.toString("latin1");
-        if (h.includes("\r\n\r\n") || h.length > 8192) {
-          const m = h.match(/HTTP\/1\.[01] (\d+)/);
-          const st = m ? +m[1] : 0;
-          try { sec.destroy(); } catch (_) {}
-          ok(st >= 200 && st < 500);
-        }
-      });
+
+    try {
+      proxy = parseProxy(p);
+    } catch (_) {
+      resolve(false);
+      return;
     }
+
+    let finished = false;
+    let timer = null;
+    let sock = null;
+    let sec = null;
+
+    const finish = (value) => {
+      if (finished) return;
+      finished = true;
+
+      if (timer) clearTimeout(timer);
+
+      try {
+        if (sec) sec.destroy();
+      } catch (_) {}
+
+      try {
+        if (sock) sock.destroy();
+      } catch (_) {}
+
+      resolve(value);
+    };
+
+    timer = setTimeout(() => finish(false), timeoutMs);
+
+    sock = net.connect({
+      host: proxy.host,
+      port: proxy.port,
+    });
+
+    sock.once("error", () => finish(false));
+
+    sock.once("connect", () => {
+      let req =
+        `CONNECT ${TARGET}:443 HTTP/1.1\r\n` +
+        `Host: ${TARGET}:443\r\n` +
+        `Proxy-Connection: Keep-Alive\r\n`;
+
+      if (proxy.auth) {
+        req +=
+          `Proxy-Authorization: Basic ` +
+          Buffer.from(proxy.auth).toString("base64") +
+          "\r\n";
+      }
+
+      req += "\r\n";
+
+      try {
+        sock.write(req);
+      } catch (_) {
+        finish(false);
+      }
+    });
+
+    let buf = "";
+
+    const onProxyData = (c) => {
+      buf += c.toString("latin1");
+
+      // Evita acumular respuestas enormes de proxies defectuosos.
+      if (buf.length > 16384 && !buf.includes("\r\n\r\n")) {
+        finish(false);
+        return;
+      }
+
+      const end = buf.indexOf("\r\n\r\n");
+      if (end < 0) return;
+
+      if (!/^HTTP\/1\.[01]\s+200\b/i.test(buf)) {
+        finish(false);
+        return;
+      }
+
+      // Muy importante:
+      // quitamos el listener ANTES de entregar el socket a TLS.
+      sock.off("data", onProxyData);
+
+      try {
+        sec = tls.connect({
+          socket: sock,
+          servername: TARGET,
+          rejectUnauthorized: true,
+        });
+
+        sec.once("error", () => finish(false));
+
+        sec.once("secureConnect", () => {
+          try {
+            sec.write(
+              `GET / HTTP/1.1\r\n` +
+              `Host: ${TARGET}\r\n` +
+              `User-Agent: Mozilla/5.0\r\n` +
+              `Accept: */*\r\n` +
+              `Connection: close\r\n\r\n`
+            );
+          } catch (_) {
+            finish(false);
+          }
+        });
+
+        let h = "";
+
+        sec.on("data", (d) => {
+          h += d.toString("latin1");
+
+          // Basta con recibir headers.
+          if (h.includes("\r\n\r\n") || h.length > 8192) {
+            const m = h.match(/^HTTP\/1\.[01]\s+(\d+)/m);
+            const st = m ? Number(m[1]) : 0;
+
+            finish(st >= 200 && st < 500);
+          }
+        });
+      } catch (_) {
+        finish(false);
+      }
+    };
+
+    sock.on("data", onProxyData);
   });
 }
-// ip -> int
-const ipInt = (ip) => ip.split(".").reduce((a, b) => a * 256 + +b, 0) >>> 0;
+
+/*
+ * ip -> uint32
+ */
+const ipInt = (ip) =>
+  ip.split(".").reduce((a, b) => a * 256 + Number(b), 0) >>> 0;
+
 let ranges = null;
+
 function loadZones() {
   if (ranges) return ranges;
+
   ranges = [];
+
   const dir = path.join(__dirname, "ip-zones");
+
   for (const f of fs.readdirSync(dir)) {
     if (!f.endsWith(".zone")) continue;
+
     const cc = f.slice(0, -5).toUpperCase();
-    for (const line of fs.readFileSync(path.join(dir, f), "utf8").split("\n")) {
+    const data = fs.readFileSync(path.join(dir, f), "utf8");
+
+    for (const line of data.split("\n")) {
       const m = line.trim().match(/^(\d+\.\d+\.\d+\.\d+)\/(\d+)$/);
+
       if (!m) continue;
-      const base = ipInt(m[1]), bits = +m[2];
+
+      const base = ipInt(m[1]);
+      const bits = Number(m[2]);
+
       const size = bits >= 32 ? 1 : 2 ** (32 - bits);
+
       ranges.push([base, base + size - 1, cc]);
     }
   }
+
   ranges.sort((a, b) => a[0] - b[0]);
+
   return ranges;
 }
+
 function countryOf(ip) {
-  const v = ipInt(ip), r = loadZones();
-  let lo = 0, hi = r.length - 1, ans = -1;
-  while (lo <= hi) { const m = (lo + hi) >> 1; if (r[m][0] <= v) { ans = m; lo = m + 1; } else hi = m - 1; }
-  for (const j of [ans - 1, ans, ans + 1]) // rangos disjuntos; reviso vecinos por seguridad
-    if (j >= 0 && j < r.length && r[j][0] <= v && v <= r[j][1]) return r[j][2];
+  const v = ipInt(ip);
+  const r = loadZones();
+
+  let lo = 0;
+  let hi = r.length - 1;
+  let ans = -1;
+
+  while (lo <= hi) {
+    const m = (lo + hi) >> 1;
+
+    if (r[m][0] <= v) {
+      ans = m;
+      lo = m + 1;
+    } else {
+      hi = m - 1;
+    }
+  }
+
+  // Los rangos son disjuntos, pero mantenemos la comprobacion vecina
+  // por compatibilidad con la version original.
+  for (const j of [ans - 1, ans, ans + 1]) {
+    if (
+      j >= 0 &&
+      j < r.length &&
+      r[j][0] <= v &&
+      v <= r[j][1]
+    ) {
+      return r[j][2];
+    }
+  }
+
   return "??";
 }
 
-(async () => {
-  const jobs = Math.min(parseInt(opt("--jobs", "60"), 10) || 60, 100);
-  const timeoutMs = parseInt(opt("--timeout", "6000"), 10) || 6000;
-  const outFile = path.resolve(opt("--out", "proxies-valid.txt"));
-  const byCountryFile = path.join(path.dirname(outFile), "proxies-by-country.json");
-  const want = new Set(fs.readFileSync(path.join(__dirname, "countries.txt"), "utf8").split(/[\s]+/).filter(Boolean));
-  console.log(`Paises objetivo (${want.size}): ${[...want].join(",")}`);
+/*
+ * Ejecuta una funcion sobre una lista usando workers persistentes.
+ * No usa shift(), por lo que la cola sigue siendo O(1) por elemento.
+ */
+async function runWorkers(items, workerCount, fn) {
+  if (!items.length) return [];
 
-  // 1. pool por pais (serie + pausa: geonode rate-limitea en rafaga)
-  const tag = new Map(); // proxy -> cc
-  for (const cc of want) {
-    try { clean((await fetchText(PS(cc))).split(/[\r\n]+/)).forEach((p) => tag.set(p, cc)); } catch (_) {}
-    for (let pg = 1; pg <= 2; pg++) {
-      try {
-        const j = JSON.parse(await fetchText(GEO(cc, pg)));
-        ((j && j.data) || []).map((x) => `${x.ip}:${x.port}`).filter((s) => clean([s]).length).forEach((p) => tag.set(p, cc));
-      } catch (_) {}
-      await sleep(400);
-    }
-    process.stdout.write(`\r bajando por-pais ${tag.size} proxies... ${cc}`);
-    await sleep(400);
-  }
-  console.log(`\n por-pais: ${tag.size} proxies`);
-  // 2. bulk: filtro ANTES por rangos locales, solo paises objetivo
-  if (!has("--no-bulk")) {
-    let n = 0, kept = 0;
-    for (const u of BULKS) {
-      try {
-        for (const p of clean((await fetchText(u)).split(/[\r\n]+/))) {
-          if (tag.has(p)) continue;
-          n++;
-          const cc = countryOf(p.split(":")[0]);
-          if (want.has(cc)) { tag.set(p, cc); kept++; }
-        }
-      } catch (e) { console.log(` bulk ${u.slice(-30)}: - (${e.message})`); }
-    }
-    console.log(` bulk: ${kept}/${n} en paises objetivo`);
-  }
-  const extra = opt("--extra", "");
-  if (extra) {
-    let n = 0;
-    for (const p of clean(fs.readFileSync(path.resolve(extra), "utf8").split(/[\r\n]+/))) {
-      if (tag.has(p)) continue;
-      const cc = countryOf(p.split(":")[0]);
-      if (want.has(cc)) { tag.set(p, cc); n++; }
-    }
-    console.log(` extra ${extra}: ${n} en paises objetivo`);
-  }
-  const all = [...tag.keys()];
-  console.log(`Total a probar: ${all.length}`);
+  const results = [];
+  let index = 0;
 
-  // 3. TCP rapido (descarta muertos sin costo TLS)
-  const open = [];
-  for (let k = 0; k < all.length; k += 1000) {
-    const r = await Promise.all(all.slice(k, k + 1000).map((p) => tcpOpen(p, 1500)));
-    r.forEach((p) => p && open.push(p));
-    process.stdout.write(`\r tcp ${Math.min(k + 1000, all.length)}/${all.length} abiertos=${open.length}`);
-  }
-  console.log(`\nTCP abiertos: ${open.length}/${all.length}`);
-
-  // 4. check real contra TARGET
-  const ok = [];
-  let n = 0;
-  const q = [...open];
   const worker = async () => {
-    while (q.length) {
-      const p = q.shift();
-      n++;
-      if (await targetCheck(p, timeoutMs)) { ok.push(p); console.log(`[${n}/${open.length}] ${p} OK (${tag.get(p)})`); }
-      else if (n % 100 === 0) console.log(` ... ${n}/${open.length} ok=${ok.length}`);
+    while (true) {
+      const i = index++;
+
+      if (i >= items.length) return;
+
+      try {
+        const result = await fn(items[i], i);
+
+        if (result !== null && result !== undefined && result !== false) {
+          results.push(result);
+        }
+      } catch (_) {}
     }
   };
-  await Promise.all(Array.from({ length: Math.min(jobs, q.length || 1) }, worker));
 
-  // 5. guardar
-  const byCc = {};
-  for (const p of ok) {
-    const cc = tag.get(p) || countryOf(p.split(":")[0]);
-    if (!want.has(cc)) continue;
-    (byCc[cc] = byCc[cc] || []).push(p);
+  const n = Math.min(workerCount, items.length);
+
+  await Promise.all(
+    Array.from({ length: n }, () => worker())
+  );
+
+  return results;
+}
+
+/*
+ * Descarga las fuentes de un pais.
+ *
+ * ProxyScrape + 2 paginas de GeoNode se ejecutan en paralelo.
+ * Solo se limita la cantidad de paises simultaneos para no golpear
+ * las APIs con una rafaga enorme.
+ */
+async function fetchCountry(cc) {
+  const promises = [
+    fetchText(PS(cc))
+      .then((txt) => clean(txt.split(/[\r\n]+/)))
+      .catch(() => []),
+
+    fetchText(GEO(cc, 1))
+      .then((txt) => {
+        const j = JSON.parse(txt);
+        return ((j && j.data) || [])
+          .map((x) => `${x.ip}:${x.port}`)
+          .filter((s) => clean([s]).length);
+      })
+      .catch(() => []),
+
+    fetchText(GEO(cc, 2))
+      .then((txt) => {
+        const j = JSON.parse(txt);
+        return ((j && j.data) || [])
+          .map((x) => `${x.ip}:${x.port}`)
+          .filter((s) => clean([s]).length);
+      })
+      .catch(() => []),
+  ];
+
+  const [ps, geo1, geo2] = await Promise.all(promises);
+
+  return [...new Set([...ps, ...geo1, ...geo2])];
+}
+
+(async () => {
+  const jobs = intOpt("--jobs", 120, 1, 1000);
+  const tcpJobs = intOpt("--tcp-jobs", 300, 1, 2000);
+  const tcpTimeout = intOpt("--tcp-timeout", 1200, 100, 10000);
+  const timeoutMs = intOpt("--timeout", 6000, 500, 30000);
+  const sourceJobs = intOpt("--source-jobs", 4, 1, 20);
+  const progressEvery = intOpt("--progress", 100, 1, 10000);
+
+  const outFile = path.resolve(
+    opt("--out", "proxies-valid.txt")
+  );
+
+  const byCountryFile = path.join(
+    path.dirname(outFile),
+    "proxies-by-country.json"
+  );
+
+  const countriesFile = path.join(
+    __dirname,
+    "countries.txt"
+  );
+
+  const want = new Set(
+    fs
+      .readFileSync(countriesFile, "utf8")
+      .split(/[\s]+/)
+      .filter(Boolean)
+      .map((x) => x.toUpperCase())
+  );
+
+  console.log(
+    `Paises objetivo (${want.size}): ${[...want].join(",")}`
+  );
+
+  console.log(
+    `Configuracion: tcp-jobs=${tcpJobs}, jobs=${jobs}, ` +
+    `tcp-timeout=${tcpTimeout}ms, timeout=${timeoutMs}ms`
+  );
+
+  /*
+   * 1. Fuentes por pais
+   */
+  const tag = new Map();
+
+  const countries = [...want];
+
+  let countryDone = 0;
+
+  await runWorkers(
+    countries,
+    sourceJobs,
+    async (cc) => {
+      const proxies = await fetchCountry(cc);
+
+      for (const p of proxies) {
+        if (!tag.has(p)) {
+          tag.set(p, cc);
+        }
+      }
+
+      countryDone++;
+
+      process.stdout.write(
+        `\r fuentes por-pais: ${countryDone}/${countries.length} ` +
+        `proxies=${tag.size}`
+      );
+
+      return null;
+    }
+  );
+
+  console.log(
+    `\n por-pais: ${tag.size} proxies`
+  );
+
+  /*
+   * 2. Bulk:
+   * descargamos las listas en paralelo.
+   *
+   * El filtro por pais se hace antes de agregarlas al pool.
+   */
+  if (!has("--no-bulk")) {
+    console.log(`Descargando ${BULKS.length} listas bulk...`);
+
+    const bulkResults = await Promise.all(
+      BULKS.map(async (u) => {
+        try {
+          return clean(
+            (await fetchText(u)).split(/[\r\n]+/)
+          );
+        } catch (e) {
+          console.log(
+            `\n bulk ${u.slice(-45)}: error (${e.message})`
+          );
+          return [];
+        }
+      })
+    );
+
+    let bulkSeen = 0;
+    let bulkKept = 0;
+
+    for (const list of bulkResults) {
+      for (const p of list) {
+        if (tag.has(p)) continue;
+
+        bulkSeen++;
+
+        const cc = countryOf(
+          p.slice(0, p.lastIndexOf(":"))
+        );
+
+        if (want.has(cc)) {
+          tag.set(p, cc);
+          bulkKept++;
+        }
+      }
+    }
+
+    console.log(
+      ` bulk: ${bulkKept}/${bulkSeen} en paises objetivo`
+    );
   }
+
+  /*
+   * 3. Extra
+   */
+  const extra = opt("--extra", "");
+
+  if (extra) {
+    let n = 0;
+
+    const extraList = clean(
+      fs
+        .readFileSync(path.resolve(extra), "utf8")
+        .split(/[\r\n]+/)
+    );
+
+    for (const p of extraList) {
+      if (tag.has(p)) continue;
+
+      const cc = countryOf(
+        p.slice(0, p.lastIndexOf(":"))
+      );
+
+      if (want.has(cc)) {
+        tag.set(p, cc);
+        n++;
+      }
+    }
+
+    console.log(
+      ` extra ${extra}: ${n} en paises objetivo`
+    );
+  }
+
+  const all = [...tag.keys()];
+
+  console.log(`Total a probar: ${all.length}`);
+
+  /*
+   * 4. TCP rapido
+   *
+   * Antes habia bloques de 1000:
+   *
+   *   esperar 1000 -> esperar -> siguientes 1000
+   *
+   * Ahora tenemos workers persistentes:
+   *
+   *   termina uno -> inmediatamente entra otro.
+   */
+  console.log(
+    `TCP check: ${tcpJobs} conexiones simultaneas...`
+  );
+
+  let tcpDone = 0;
+
+  const open = [];
+
+  await runWorkers(
+    all,
+    tcpJobs,
+    async (p) => {
+      const r = await tcpOpen(p, tcpTimeout);
+
+      tcpDone++;
+
+      if (r) open.push(r);
+
+      if (
+        tcpDone % progressEvery === 0 ||
+        tcpDone === all.length
+      ) {
+        process.stdout.write(
+          `\r tcp ${tcpDone}/${all.length} abiertos=${open.length}`
+        );
+      }
+
+      return null;
+    }
+  );
+
+  console.log(
+    `\nTCP abiertos: ${open.length}/${all.length}`
+  );
+
+  /*
+   * 5. Check real contra TARGET
+   */
+  console.log(
+    `Check TARGET ${TARGET}: ${jobs} conexiones simultaneas...`
+  );
+
+  const ok = [];
+  let checked = 0;
+
+  await runWorkers(
+    open,
+    jobs,
+    async (p) => {
+      const good = await targetCheck(p, timeoutMs);
+
+      checked++;
+
+      if (good) {
+        ok.push(p);
+      }
+
+      if (
+        checked % progressEvery === 0 ||
+        checked === open.length
+      ) {
+        process.stdout.write(
+          `\r target ${checked}/${open.length} ` +
+          `validos=${ok.length}`
+        );
+      }
+
+      return null;
+    }
+  );
+
+  console.log(
+    `\nTARGET validos: ${ok.length}/${open.length}`
+  );
+
+  /*
+   * 6. Guardar
+   */
+  const byCc = {};
+
+  for (const p of ok) {
+    const cc =
+      tag.get(p) ||
+      countryOf(p.slice(0, p.lastIndexOf(":")));
+
+    if (!want.has(cc)) continue;
+
+    (byCc[cc] ||= []).push(p);
+  }
+
   const valid = Object.values(byCc).flat();
-  try { if (fs.existsSync(outFile)) fs.copyFileSync(outFile, outFile + ".bak"); } catch (_) {}
-  fs.writeFileSync(outFile, valid.join("\n") + (valid.length ? "\n" : ""));
-  fs.writeFileSync(byCountryFile, JSON.stringify(byCc, null, 1));
-  console.log(`\nFIN: ${valid.length}/${ok.length} en paises objetivo -> ${outFile}`);
-  for (const cc of Object.keys(byCc).sort()) console.log(`  ${cc}: ${byCc[cc].length}`);
-  console.log(`Descartados fuera de objetivo: ${ok.length - valid.length}`);
-  process.exit(0); // sin esto Node se queda colgado por sockets/timers abiertos
-})().catch((e) => { console.error("ERROR", e.message); process.exit(1); });
+
+  try {
+    if (fs.existsSync(outFile)) {
+      fs.copyFileSync(
+        outFile,
+        outFile + ".bak"
+      );
+    }
+  } catch (_) {}
+
+  fs.writeFileSync(
+    outFile,
+    valid.join("\n") +
+      (valid.length ? "\n" : "")
+  );
+
+  fs.writeFileSync(
+    byCountryFile,
+    JSON.stringify(byCc, null, 1)
+  );
+
+  console.log(
+    `\nFIN: ${valid.length}/${ok.length} ` +
+    `en paises objetivo -> ${outFile}`
+  );
+
+  for (const cc of Object.keys(byCc).sort()) {
+    console.log(
+      `  ${cc}: ${byCc[cc].length}`
+    );
+  }
+
+  console.log(
+    `Descartados fuera de objetivo: ` +
+    `${ok.length - valid.length}`
+  );
+
+  /*
+   * Forzar salida para evitar que algun socket/timer residual
+   * mantenga vivo el proceso.
+   */
+  process.exit(0);
+})().catch((e) => {
+  console.error("ERROR", e);
+  process.exit(1);
+});

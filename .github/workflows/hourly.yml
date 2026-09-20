@@ -1,7 +1,7 @@
-name: hourly proxy check
+name: proxy check
 on:
   schedule:
-    - cron: "*/10 * * * *" # cada 10 min (UTC)
+    - cron: "*/15 * * * *" # cada 15 min (UTC)
   workflow_dispatch: # boton manual en Actions
 
 jobs:

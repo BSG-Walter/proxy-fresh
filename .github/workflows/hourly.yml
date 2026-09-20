@@ -2,7 +2,7 @@ name: proxy check
 
 on:
   schedule:
-    - cron: "*/15 * * * *" # cada 15 min (UTC)
+    - cron: "7,22,37,52 * * * *"
   workflow_dispatch:
 
 jobs:

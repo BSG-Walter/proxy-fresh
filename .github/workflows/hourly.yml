@@ -1,20 +1,32 @@
 name: proxy check
+
 on:
   schedule:
     - cron: "*/15 * * * *" # cada 15 min (UTC)
-  workflow_dispatch: # boton manual en Actions
+  workflow_dispatch:
 
 jobs:
   check:
     runs-on: ubuntu-latest
     timeout-minutes: 50
+
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - run: node check.js --out proxies-valid.txt
-      - name: commit results
+
+      - name: Check proxies
+        run: |
+          node check.js \
+            --out proxies-valid.txt \
+            --tcp-jobs 300 \
+            --jobs 120 \
+            --tcp-timeout 1200 \
+            --timeout 6000
+
+      - name: Commit results
         run: |
           git config user.name "proxy-bot"
           git config user.email "proxy-bot@users.noreply.github.com"

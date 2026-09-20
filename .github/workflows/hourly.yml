@@ -1,0 +1,23 @@
+name: hourly proxy check
+on:
+  schedule:
+    - cron: "*/10 * * * *" # cada 10 min (UTC)
+  workflow_dispatch: # boton manual en Actions
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: node check.js --out proxies-valid.txt
+      - name: commit results
+        run: |
+          git config user.name "proxy-bot"
+          git config user.email "proxy-bot@users.noreply.github.com"
+          git add proxies-valid.txt proxies-by-country.json
+          git diff --cached --quiet || git commit -m "update $(date -u +%F-%H:%M)"
+          git push
